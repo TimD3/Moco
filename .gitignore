@@ -1,0 +1,6 @@
+data/*
+.vscode/*
+checkpoints/*
+logs/*
+__pycache__
+!*.gitkeep
