@@ -78,3 +78,12 @@ def dataclass_to_dict_of_lists(dataclass_list, stack=False):
     if stack:
         dict_of_lists = {k: jnp.stack(v) for k, v in dict_of_lists.items()}
     return dict_of_lists
+
+if __name__ == "__main__":
+    series = [{"a": [1,2,3], "b": [4,5,6]}, {"a": [1,3,5], "b": [10,11,12]}]
+    avg_series = average_dict_of_time_series(series)
+    print(avg_series)
+    
+    assert np.allclose(avg_series["a"], [1,2.5,4])
+    assert np.allclose(avg_series["b"], [7,8,9])
+    print("Passed!")

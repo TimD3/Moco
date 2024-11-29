@@ -50,14 +50,12 @@ class GNNLOptState:
 import haiku as hk
 
 class HeatmapOptimizer(lopt_base.LearnedOptimizer):
-  def __init__(self, update_strategy='direct', embedding_size=64, num_layers_init=3, num_layers_update=3, aggregation='max', normalize_inputs=False, exp_mult=0.1, step_mult=0.1, compute_summary=True, num_node_features=1, num_edge_features=41, num_global_features=45, normalization="pre", dummy_observation=None):
+  def __init__(self, update_strategy='direct', embedding_size=64, num_layers_init=3, num_layers_update=3, aggregation='max', normalize_inputs=False, compute_summary=True, num_node_features=1, num_edge_features=41, num_global_features=45, normalization="pre", dummy_observation=None):
     self._compute_summary = compute_summary
     self.embedding_size = embedding_size
     self.num_layers_update = num_layers_update
     self.num_layers_init = num_layers_init
     self.normalize_inputs = normalize_inputs
-    self.exp_mult = exp_mult
-    self.step_mult = step_mult
     self.num_node_features = num_node_features
     self.num_edge_features = num_edge_features
     self.num_global_features = num_global_features
@@ -76,7 +74,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         update_globals = True, 
         decode_globals = True if self.update_strategy == 'temperature' else False, 
         decode_edges = True, 
-        decode_edge_dimension = 2 if self.update_strategy == 'difference' else 1, 
+        decode_edge_dimension = 1, 
         decode_global_dimension = 1,
         normalization=self.normalization
         )
@@ -156,8 +154,6 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
     normalize = self.normalize_inputs
     init_net = self.init_net
     update_net = self.update_net
-    exp_mult = self.exp_mult
-    step_mult = self.step_mult
     compute_summary = self._compute_summary
     update_strategy = self.update_strategy
     # total_steps = self.total_steps
@@ -180,7 +176,8 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         output = init_net.apply(theta['init_params'], graph)
 
         params = flax.core.unfreeze(params)
-        params['params']['heatmap'] = graph.edges.reshape(n,k)
+        # params['params']['heatmap'] = graph.edges.reshape(n,k)
+        params['params']['heatmap'] = output.edges.reshape(n,k)
         params = flax.core.freeze(params)
 
         return GNNLOptState(
@@ -253,16 +250,6 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         elif update_strategy == 'temperature':
           temp = 0.5*(jax.nn.tanh(output.globals)+1) # temperature between 0 and 1
           new_p = (output.edges / temp).reshape(n,k)
-
-        elif update_strategy == 'difference':
-          # split the 2 outputs up into a direction and a magnitude
-          direction = output.edges[..., 0]
-          magnitude = output.edges[..., 1]
-
-          # compute the step
-          step = direction * jnp.exp(magnitude * exp_mult) * step_mult
-          step = step.reshape(n,k)
-          new_p = opt_state.params['params']['heatmap'] - step
 
         new_opt_state = GNNLOptState(
           params=jax.tree_util.tree_map(lambda _: new_p, opt_state.params),
@@ -446,9 +433,3 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         )
         return new_opt_state
     return _Opt()
-  
-
-if __name__ == '__main__':
-  optimizer = HeatmapOptimizer()
-  params = optimizer.init(jax.random.PRNGKey(42))
-  print(jax.tree_map(lambda x: x.shape, params))

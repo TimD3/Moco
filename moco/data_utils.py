@@ -13,15 +13,22 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union, Lis
 from moco.mis_generation.random_graph import imap_unordered_bar
 import time
 from multiprocessing import Pool
+import tqdm
 
 def load_and_process(filename):
-    print(f"Processing {filename}")
+    # print(f"Processing {filename}")
     data = nx.read_gpickle(filename)
-    print(f"Converting to Pytorch Geometric")
-    data = from_networkx(data)
-    if data.num_node_features == 0:
-        data.x = torch.ones(data.num_nodes, 1)
-    return data
+    # print(f"Converting to Pytorch Geometric")
+    with torch.no_grad():
+        data_pyg = from_networkx(data)
+    # with torch.no_grad():
+    #     edge_index = torch.tensor([i for i in zip(*data.edges)], dtype=torch.long)
+    #     x = torch.ones(len(data.nodes), 1)
+
+    # breakpoint()
+        if data_pyg.num_node_features == 0:
+            data_pyg.x = torch.ones(data_pyg.num_nodes, 1)
+    return data_pyg
 
 class MisDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None, pre_filter=None, num_processes=1):
@@ -47,17 +54,11 @@ class MisDataset(InMemoryDataset):
         data_list = []
         files = [os.path.join(self.root, filename) for filename in self.raw_file_names]
         # use multiprocessing to speed up processing
-        with Pool(self.num_processes) as p:
-            data_list = p.map(load_and_process, files)
-        
-        # for filename in self.raw_file_names:
-        #     print(f"Processing {filename}")
-        #     data = nx.read_gpickle(os.path.join(self.root, filename))
-        #     print(f"Converting to Pytorch Geometric")
-        #     data = from_networkx(data)
-        #     if data.num_node_features == 0:
-        #         data.x = torch.ones(data.num_nodes, 1)
-        #     data_list.append(data)
+        # with Pool(self.num_processes) as p:
+        #     data_list = p.map(load_and_process, files)
+        # use tqdm to show progress
+
+        data_list = [load_and_process(f) for f in tqdm.tqdm(files)]
 
         if self.pre_filter is not None:
             data_list = [data for data in data_list if self.pre_filter(data)]
@@ -187,45 +188,4 @@ def pyg_to_jraph(graph):
             receivers=np.array(graph.edge_index[1])
         )
     return graphs
-
-if __name__ == "__main__":
-
-    # Parse arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--problem_type", type=str, help="type of problem to generate data for", choices=["tsp", "mis"])
-    # for TSP
-    parser.add_argument("--problem_size", type=int, help="size of the problem (number of cities in TSP)")
-    parser.add_argument("--num_samples", type=int, help="number of samples to generate")
-    parser.add_argument("--path", help="path to the output file")
-    parser.add_argument("--seed", type=int, help="seed for the random number generator")
-    # for MIS
-    parser.add_argument("--data_path", type=str, help="path to the output file")
-    parser.add_argument("--min_n", type=int, help="min number of nodes")
-    parser.add_argument("--max_n", type=int, help="max number of nodes")
-    parser.add_argument("--edge_probability", type=float, help="edge probability")
-    parser.add_argument("--num_samples", type=int, help="number of samples to generate")
-
-    args = parser.parse_args()
-    
-    if args.problem_type == "tsp":
-        # create and save data
-        key = jax.random.PRNGKey(args.seed)
-        data = jax.vmap(sample_tsp, in_axes=(0, None))(jax.random.split(key, args.num_samples), args.problem_size)
-        data = np.array(data)
-        print(f'Saving data of shape {data.shape} to {args.path}')
-        np.save(args.path, data)
-
-    elif args.problem_type == "mis":
-
-        from moco.mis_generation.random_graph import RandomGraphGenerator
-        from moco.mis_generation.random_graph import ErdosRenyi
-        from moco.data_utils import MisDataset
-        from pathlib import Path
-        data_path = Path(args.data_path) #"/home/tim/Documents/research/data/mis/er_train_tiny"
-        sampler = ErdosRenyi(args.min_n, args.max_n, args.edge_probability)
-        generator = RandomGraphGenerator(data_path, graph_sampler = sampler, num_graphs = args.num_samples)
-        generator.generate()
-        # get number threads
-        num_processes = os.cpu_count()
-        dataset = MisDataset(data_path, num_processes=num_processes)
     

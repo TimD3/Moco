@@ -5,7 +5,7 @@ import numpy as np
 from jax import disable_jit
 from functools import partial
 import rlax
-from tqdm import tqdm
+import tqdm
 import matplotlib.pyplot as plt
 from functools import partial
 import argparse
@@ -17,8 +17,6 @@ import haiku as hk
 import optax
 import uuid
 from torch.utils.data import DataLoader
-# import jmp
-
 from datetime import datetime
 
 from learned_optimization.outer_trainers import full_es, truncated_pes, truncated_es, gradient_learner, truncation_schedule, lopt_truncated_step
@@ -51,50 +49,45 @@ if __name__ == "__main__":
     # TaskFamily and problem setting
     parser.add_argument("--train_dataset", type=str)
     parser.add_argument("--task_batch_size", type=int)
-    parser.add_argument("--num_construction_steps", type=int) # how many sequential construction steps a single rollout does on MIS. Ideally it should stop when all environments in the batch is done but because of jax.grad needs static boundaries and thus is incompatible with jax lax while we need to give a fixed predertimend num steps t run the the heatmap over the environment
+    parser.add_argument("--num_construction_steps", type=int) # how many sequential construction steps a single rollout does on MIS. Ideally it should stop when all environments in the batch are done but because jax.grad needs static boundaries and thus is incompatible with jax lax while we need to give a fixed predertimend num steps t to run the the heatmap over the environment. This then needs to be larger than the longest typical rollouts in the dataset. For Satlib, ER700, ER9000 we found 450, 50, 400 to be sufficiently high values.
     parser.add_argument("--top_k", type=int, default=32)
     parser.add_argument("--pad_to_pow2", default=False, action="store_true")
 
     # meta loss
-    parser.add_argument("--meta_loss_type", type=str, choices=["best", "difference", "log"], default="best")
+    parser.add_argument("--meta_loss_type", type=str, choices=["best", "log"], default="best")
 
     # metaTraining
     parser.add_argument("--parallel_tasks_train", type=int)
     parser.add_argument("--outer_lr", type=float)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--outer_train_steps", type=int, default=10000)
-    parser.add_argument("--gradient_estimator", type=str, choices=["full_es", "pes"], default="full_es")
-    parser.add_argument("--trunc_length", type=int, default=10) # truncation length for pes training
+    parser.add_argument("--outer_train_steps", type=int, default=20000)
     parser.add_argument("--trunc_schedule", type=str, choices=["constant", "loguniform", "piecewise_linear"], default="constant") # for full es and pes training
-    parser.add_argument("--min_length", type=int, default=10)
-    parser.add_argument("--max_length", type=int) # number of steps to unroll the optimizer on the inner task
+    parser.add_argument("--min_length", type=int, default=1)
+    parser.add_argument("--max_length", type=int, default=50) # number of steps to unroll the optimizer on the inner task
     parser.add_argument("--piecewise_linear_fraction", type=float, default=0.2, help="fraction of outer_train_steps after which the truncation length is max_length")
     parser.add_argument("--patience", type=int, default=20) # early stopping
     parser.add_argument("--dont_stack_antithetic", action="store_true") # whether to stack antithetic samples for gradient estimation
     parser.add_argument("--grad_clip", type=float, default=None)
-    parser.add_argument("--lr_schedule", type=str, choices=["constant", "cosine"], default="constant")
+    parser.add_argument("--lr_schedule", type=str, choices=["constant", "cosine"], default="cosine")
     parser.add_argument("--warmup_steps", type=int, default=50)
     parser.add_argument("--num_devices", type=int, default=None)
     parser.add_argument("--clip_loss_diff", type=float, default=None)
     parser.add_argument("--sigma", type=float, default=0.01)
-    # parser.add_argument("--mp_policy", type=str, choices=["params=float32,compute=float16,output=float32", "params=float32,compute=bfloat16,output=float32", "params=float32,compute=float32,output=float32"], default="params=float32,compute=float32,output=float32")
 
     # meta optimizer
     parser.add_argument("--aggregation", type=str, choices=["sum", "max"], default="max")
-    parser.add_argument("--embedding_size", type=int, default=64)
+    parser.add_argument("--embedding_size", type=int, default=128)
     parser.add_argument("--num_layers_init", type=int, default=3)
     parser.add_argument("--num_layers_update", type=int, default=3)
     parser.add_argument("--checkpoint_folder", "-cf", help="folder to load checkpoint from", type=str, default=None)
-    # parser.add_argument("--ignore_feature_names", nargs="+", default=['best_cost', 'mean_cost'])
 
     # validation and logging
     parser.add_argument("--parallel_tasks_val", type=int)
-    # parser.add_argument("--artifact_path", type=str, default='/home/tim/Documents/research/artifacts')
     parser.add_argument("--val_dataset", type=str)
-    parser.add_argument("--model_save_path", type=str, default="checkpoints")
+    parser.add_argument("--model_save_path", type=str)
     parser.add_argument("--val_steps", type=int, default=200)
     parser.add_argument("--log_steps", type=int, default=1)
-    parser.add_argument("--mlflow_uri", type=str, default="logs/mlruns")
+    parser.add_argument("--mlflow_uri", type=str, default="logs")
     parser.add_argument("--experiment_name", type=str, default="meta_mis")
     parser.add_argument("--disable_tqdm", default=False, action="store_true")
     parser.add_argument("--ood_dataset", default=None, type=str)
@@ -113,12 +106,13 @@ if __name__ == "__main__":
     if args.num_devices is None:
         args.num_devices = len(jax.devices())
 
-    # assert args.trunc_length <= args.max_length, "trunc_length must be smaller than max_length"
     assert args.min_length <= args.max_length, "loguniform_trunc_min must be smaller equal than max_length"
     assert args.parallel_tasks_train % args.num_devices == 0, f"parallel_tasks_train must be divisible by num_devices {args.num_devices}, jax_devices: {jax.devices()}"
     assert args.parallel_tasks_val % args.num_devices == 0, f"parallel_tasks_val must be divisible by num_devices {args.num_devices}, jax_devices: {jax.devices()}"
     
     # test gpu # TODO: switch to chex 
+    print("Python is running")
+    print("jax devices:", jax.devices())
     print("jax has gpu:", jax_has_gpu())
     ################## config ##################
     print("Loading dataset...")
@@ -220,44 +214,10 @@ if __name__ == "__main__":
                 clip_loss_diff=args.clip_loss_diff,
                 std=args.sigma
             )
-    
-    def truncated_es_estimator(task_family):
-        truncated_step = lopt_truncated_step.VectorizedLOptTruncatedStep(
-            task_family,
-            lopt,
-            truncation_schedule.NeverEndingTruncationSchedule(),
-            num_tasks=args.parallel_tasks_train,
-            meta_loss_with_aux_key="meta_loss",
-            task_name=str(task_family)
-        )
-        return truncated_es.TruncatedES(
-            truncated_step = truncated_step,
-            unroll_length=args.trunc_length,
-            stack_antithetic_samples=not args.dont_stack_antithetic,
-            steps_per_jit=10,
-            std=args.sigma
-        )
-                 
-    def truncated_pes_estimator(task_family):
-        truncated_step = lopt_truncated_step.VectorizedLOptTruncatedStep(
-            task_family,
-            lopt,
-            trunc_sched,
-            num_tasks=args.parallel_tasks_train,
-            random_initial_iteration_offset=args.max_length,
-            meta_loss_with_aux_key="meta_loss",
-            task_name=str(task_family)
-            )
-        return truncated_pes.TruncatedPES(
-            truncated_step=truncated_step, trunc_length=args.trunc_length, steps_per_jit=10, stack_antithetic_samples=not args.dont_stack_antithetic, std=args.sigma)
-    
-    estimators = {
-        "full_es": full_es_estimator,
-        "pes": truncated_pes_estimator
-    }
+        
     
     gradient_estimators = [
-        estimators[args.gradient_estimator](task_family),
+        full_es_estimator(task_family),
     ]
     print("gradient_estimators:", gradient_estimators)
 
@@ -269,7 +229,7 @@ if __name__ == "__main__":
             init_value=0.0,
             peak_value=args.outer_lr,
             warmup_steps=args.warmup_steps,
-            decay_steps=args.outer_train_steps - args.warmup_steps,
+            decay_steps=args.outer_train_steps,
             end_value=0.0,
             )
 
@@ -365,7 +325,7 @@ if __name__ == "__main__":
             mlflow.log_param('slurm_job_id', slurm_job_id)
             print(f'Logged slurm_job_id: {slurm_job_id}', flush=True)
 
-        for i in tqdm(range(args.outer_train_steps), disable=args.disable_tqdm):
+        for i in tqdm.tqdm(range(args.outer_train_steps), disable=args.disable_tqdm):
             # print(f"start outer step {i}", flush=True)
             # validation
             if i % args.val_steps == 0:

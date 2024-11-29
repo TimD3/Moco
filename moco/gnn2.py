@@ -52,18 +52,6 @@ class GCNLayer(hk.Module):
             transformed_global = W3(updated_graph.globals[0:1])
             nodes = nodes + transformed_global
 
-        # ln = hk.LayerNorm(axis=0, create_scale=True, create_offset=True, name='node_fn_ln')
-
-        # if self.normalization == 'pre':
-        #     nodes = ln(nodes)
-        #     nodes = jax.nn.relu(nodes)
-        # elif self.normalization == 'post':
-        #     nodes = jax.nn.relu(nodes)
-        #     nodes = ln(nodes)
-        # elif self.normalization == 'none':
-        #     nodes = jax.nn.relu(nodes)
-        # else:
-        #     raise ValueError(f"Unknown normalization {self.normalization}")
         nodes = jax.nn.relu(nodes)
         nodes = nodes + graph.nodes # res connection
         updated_graph = updated_graph._replace(nodes = nodes)

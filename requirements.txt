@@ -16,3 +16,5 @@ rlax==0.1.6
 torch==2.1.1+cpu
 torch-geometric==2.4.0
 tqdm
+numba==0.59.0
+scipy==1.10.1

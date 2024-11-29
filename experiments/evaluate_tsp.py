@@ -6,6 +6,7 @@ from functools import partial
 import time
 import timeit
 from datetime import timedelta
+
 import jax
 import jax.numpy as jnp
 from jax import disable_jit
@@ -32,17 +33,22 @@ if __name__ == '__main__':
     parser.add_argument("--seed", "-s", help="seed", type=int, default=random.randrange(sys.maxsize))
     parser.add_argument("--verbose", "-v", help="print training progress", action="store_true")
     parser.add_argument("--top_k", type=int, default=32)
-    parser.add_argument("--heatmap_init_strategy", type=str, choices=["heuristic", "constant"], default="heuristic")
+    parser.add_argument("--heatmap_init_strategy", type=str, choices=["heuristic", "constant"], default="heuristic") # gets overwritten by the model
     parser.add_argument("--rollout_actor", type=str, choices=["softmax", "entmax"], default="softmax")
-    parser.add_argument("--normalize_advantage", action="store_true")
     parser.add_argument("--k", "-k", help="number of nearest neighbors", type=int, default=None)
     parser.add_argument("--causal", "-c", help="use causal accumulation of rewards for policy gradient calc", action="store_true")
-    parser.add_argument("--baseline", "-b", help="specify baseline for policy gradient calc", type=str, default=None, choices=[None, "avg", "best"])
-    parser.add_argument("--mlflow_uri", help="mlflow uri", type=str, default="logs/mlruns")
-    parser.add_argument("--experiment", help="experiment name", type=str, default="eval_tsp")
+    parser.add_argument("--baseline", "-b", help="specify baseline for policy gradient calc", type=str, default=None, choices=[None, "avg"])
+    parser.add_argument("--mlflow_uri", help="mlflow uri", type=str, default="logs")
+    parser.add_argument("--experiment", help="experiment name", type=str, default="tsp")
     parser.add_argument("--num_starting_nodes", "-ns", help="number of starting nodes", type=int, default=1)
     parser.add_argument("--checkpoint_folder", "-cf", help="folder to load checkpoint from", type=str, default=None)
+    parser.add_argument("--two_opt_t_max", type=int, default=None)
+    parser.add_argument("--first_accept", action="store_true")
     args = parser.parse_args()
+    # pretty print arguments
+    print("Arguments:")
+    for arg in vars(args):
+        print(arg, getattr(args, arg))
     
     # test gpu
     print("jax has gpu:", jax_has_gpu())
@@ -71,18 +77,13 @@ if __name__ == '__main__':
         args.top_k = metadata['top_k']
         args.heatmap_init_strategy = metadata['heatmap_init_strategy']
         args.rollout_actor = metadata['rollout_actor']
-        args.normalize_advantage = metadata['normalize_advantage']
         args.k = metadata['k']
         args.causal = metadata['causal']
         args.baseline = metadata['baseline']
-        # if args.step_strategy == "complete":
-        #     total_steps = args.num_steps
-        # elif args.step_strategy == "naive":
-        #     total_steps = metadata['max_length']
 
         lopts = {
             "adam": lopt_base.LearnableAdam(),
-            "gnn": HeatmapOptimizer(embedding_size=metadata["embedding_size"], num_layers_init=metadata["num_layers_init"], num_layers_update=metadata["num_layers_update"], normalize_inputs=metadata["normalize_inputs"], exp_mult=metadata["exp_mult"], step_mult=metadata["step_mult"], aggregation=metadata["aggregation"], update_strategy=metadata["update_strategy"], normalization=metadata["normalization"])
+            "gnn": HeatmapOptimizer(embedding_size=metadata["embedding_size"], num_layers_init=metadata["num_layers_init"], num_layers_update=metadata["num_layers_update"], aggregation=metadata["aggregation"], update_strategy=metadata["update_strategy"], normalization=metadata["normalization"])
             }
         l_optimizer = lopts[metadata['lopt']]
         optimizer_params = restore_mngr.restore(restore_mngr.best_step())
@@ -93,12 +94,8 @@ if __name__ == '__main__':
         optimizer = Adam(learning_rate=args.learning_rate)
         print(f"Running Adam with lr {args.learning_rate}")
 
-    # pretty print arguments
-    print("Arguments:")
-    for arg in vars(args):
-        print(arg, getattr(args, arg))
+    task_family = TspTaskFamily(problem_size, args.task_batch_size, k=args.k, baseline=args.baseline, causal=args.causal, top_k=args.top_k, heatmap_init_strategy=args.heatmap_init_strategy, rollout_actor=args.rollout_actor, two_opt_t_max=args.two_opt_t_max, first_accept=args.first_accept)
 
-    task_family = TspTaskFamily(problem_size, args.task_batch_size, k=args.k, baseline=args.baseline, causal=args.causal, top_k=args.top_k, heatmap_init_strategy=args.heatmap_init_strategy, normalize_advantage=args.normalize_advantage, rollout_actor=args.rollout_actor)
     print("Task family: ", task_family)
 
     @jax.jit

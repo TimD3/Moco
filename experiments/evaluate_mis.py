@@ -6,7 +6,7 @@ from functools import partial
 import time
 import timeit
 from datetime import timedelta
-# os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1" #hopefully temporary bug with xla/nvidia/cuda or whatever, setting the flag works around that
+import numpy as np
 
 import jax
 import jax.numpy as jnp
@@ -29,17 +29,17 @@ if __name__ == '__main__':
     # Argument parsing Arguments: data_path, batch_size, num_steps, learning_rate, seed: optional if not given selects the seed randomly,  verbose: bool to print training progress
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", "-d", help="path to the data", type=str)
-    parser.add_argument("--task_batch_size", "-tb", help="batch size", type=int, default=64)
+    parser.add_argument("--task_batch_size", "-tb", help="batch size", type=int, default=32)
     parser.add_argument("--num_construction_steps", type=int)
     parser.add_argument("--pad_to_pow2", default=False, action="store_true")
-    parser.add_argument("--batch_size_eval", "-be", help="batch size", type=int, default=64)
-    parser.add_argument("--num_steps", "-n", help="number of training steps", type=int, default=200)
+    parser.add_argument("--batch_size_eval", "-be", help="batch size", type=int, default=1)
+    parser.add_argument("--num_steps", "-n", help="number of training steps", type=int, default=50)
     parser.add_argument("--seed", "-s", help="seed", type=int, default=random.randrange(sys.maxsize))
-    parser.add_argument("--mlflow_uri", help="mlflow uri", type=str, default="logs/mlruns")
+    parser.add_argument("--mlflow_uri", help="mlflow uri", type=str, default="logs")
     parser.add_argument("--experiment", help="experiment name", type=str, default="mis_eval")
     parser.add_argument("--num_parallel_heatmaps", "-nh", help="number of parallel heatmaps being optimized", type=int, default=1)
     parser.add_argument("--checkpoint_folder", "-cf", help="folder to load checkpoint from", type=str, default=None)
-    parser.add_argument("--learning_rate", "-l", help="learning rate for Adam inseat no learned optimizer is used", type=float, default=1e-2)
+    parser.add_argument("--learning_rate", "-l", help="learning rate for Adam instead no learned optimizer is used", type=float, default=1e-2)
     parser.add_argument("--chunk_size", help="chunk size for chunking the computation in case of oom", type=int, default=None)
     args = parser.parse_args()
     # pretty print arguments
@@ -111,11 +111,16 @@ if __name__ == '__main__':
     compute_start = time.time()
     
     metrics = []
+    all_times = []
     for i, batch in tqdm(enumerate(data_loader)):
+        solve_start = time.time()
         key, subkey = jax.random.split(key)
         keys = jax.random.split(subkey, batch.nodes.shape[0])
         res = jax.vmap(parallel_inference, in_axes=(0,0,None))(batch, keys, args.chunk_size)
+        solve_time = time.time() - solve_start
+        all_times.append(solve_time)
         metrics.append(res)
+    median_time = np.median(np.array(all_times))    
 
     # aggregate batches of results
     # results = {key:jnp.mean(jnp.concatenate([val[key] for val in metrics], axis=0), axis=0) for key in metrics[0].keys()}
@@ -136,6 +141,8 @@ if __name__ == '__main__':
             mlflow.log_metrics({key:val[i].item() for key, val in results.items()}, step=i)
         mlflow.log_metrics({'max_construction_steps': best_rewards.max().item()})
         mlflow.log_metrics({'total_compute_time': compute_end - compute_start})
+        mlflow.log_metrics({'median_solve_batch_time': median_time})
 
     last_best_reward = results['best_reward'][-1]
     print(f"Last best reward: {last_best_reward}")
+    print(f"Median solve batch time: {median_time}")

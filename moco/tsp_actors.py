@@ -130,4 +130,3 @@ def fully_connected_graph(coordinates: jnp.array, include_coordinates: bool = Fa
 	return graph
 
 
-

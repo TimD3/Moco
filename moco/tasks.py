@@ -23,6 +23,7 @@ from jumanji.environments.routing.tsp.generator import Generator, UniformGenerat
 from moco.data_utils import sample_tsp
 from moco.tsp_actors import nearest_neighbor, HeatmapActor, knn_graph, fully_connected_graph, SparseHeatmapActor
 from moco.rl_utils import random_actor, greedy_actor, rollout, random_initial_position, greedy_rollout, pomo_rollout, entmax_actor, entmax_policy_gradient_loss
+from moco.two_opt import two_opt_once, _two_opt_python, batched_two_opt_python, jax_two_opt_cb
 
 @dataclass
 class TspTaskParams:
@@ -47,7 +48,7 @@ class TspMetrics:
     reward_std: Array
 
 class TspTaskFamily(tasks_base.TaskFamily):
-    def __init__(self, problem_size: int, batch_size: int, k: int, baseline: Optional[str] = None, causal: bool = False, meta_loss_type: str = 'best', top_k: int = 32, heatmap_init_strategy: str = 'constant', normalize_advantage=False, rollout_actor: str = 'softmax'):
+    def __init__(self, problem_size: int, batch_size: int, k: int, baseline: Optional[str] = None, causal: bool = False, meta_loss_type: str = 'best', top_k: int = 32, heatmap_init_strategy: str = 'constant', rollout_actor: str = 'softmax', two_opt_t_max: Optional[int] = None, first_accept: bool = True):
         super().__init__()
         self.datasets = None
         self.problem_size = problem_size
@@ -56,16 +57,16 @@ class TspTaskFamily(tasks_base.TaskFamily):
         # self.exp_beta = exp_beta
         self.baseline = baseline # options = None (no baseline), 'avg' (average reward), 'best' (best reward)
         self.causal = causal
-        self.normalize_advantage=normalize_advantage
-        self.meta_loss_type = meta_loss_type # options = 'best', 'difference', TODO: 'log'
-        self.heatmap_init_strategy = heatmap_init_strategy # options = 'constant', 'heuristic'
-        self.rollout_actor = rollout_actor # options = 'softmax', 'entmax', 'greedy', 'random'
+        self.meta_loss_type = meta_loss_type # options = 'best', 'difference', 'log'
         # with 'best' meta loss at each step is the best so far found solution,
         # with 'difference' meta loss is the difference between the best so far found solution and the best solution in the batch of trajectories
         # clipped at 0, such that the sum of the meta losses over the time steps reflects the best found solution over the optimization steps
+        self.heatmap_init_strategy = heatmap_init_strategy # options = 'constant', 'heuristic'
+        self.rollout_actor = rollout_actor # options = 'softmax', 'entmax', 'greedy', 'random'
+        self.two_opt_t_max = two_opt_t_max # None or int, if not None, the rollout will be a two opt rollout with a maximum number of iterations
+        self.first_accept = first_accept # acceptance criterion for two opt
         self.top_k = top_k
         assert top_k <= batch_size, "top k must be smaller equal to batch size, otherwise currently the relative gaps include -inf in the first step since not all top k solutions are filled"
-
     def __repr__(self) -> str:
         return f"TspTaskFamily_n{self.problem_size}_k{self.k}_b{self.batch_size}"
 
@@ -82,10 +83,10 @@ class TspTaskFamily(tasks_base.TaskFamily):
         batch_size = self.batch_size
         problem = task_params.coordinates
         starting_node = task_params.starting_node
+        graph = knn_graph(problem, k)
         # exp_baseline_decay = self.exp_beta
         baseline = self.baseline
         causal = self.causal
-        normalize_advantage=self.normalize_advantage
         meta_loss_type = self.meta_loss_type
         top_k = self.top_k
         heatmap_init_strategy = self.heatmap_init_strategy
@@ -96,7 +97,14 @@ class TspTaskFamily(tasks_base.TaskFamily):
             actor = entmax_actor
         else:
             raise NotImplementedError
-
+        two_opt_t_max = self.two_opt_t_max
+        first_accept = self.first_accept
+        if two_opt_t_max is not None:
+                dense_distance_matrix = jnp.linalg.norm(problem[:,None] - problem[None], axis=-1)
+                dense_distance_matrix = dense_distance_matrix.at[jnp.arange(problem_size), jnp.arange(problem_size)].set(1e9)
+            # dense_distance_matrix = jax.device_put(dense_distance_matrix, jax.devices("cpu")[0])
+            # dense_distance_matrix = np.asarray(dense_distance_matrix)
+        
         class _Task(tasks_base.Task):
 
             def _rollout(self, params, rng):
@@ -111,10 +119,9 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 return final_state, logits, timesteps
             
             def _compute_advantages(self, r, best_reward=None):
-                total_reward = r.sum(axis=-1, keepdims=True)
-                mean_reward = total_reward.mean()
-                cum_reward = r[:,::-1].cumsum(-1)[:,::-1]
                 if causal:
+                    chex.assert_shape(r, (None, problem_size-1))
+                    cum_reward = r[:,::-1].cumsum(-1)[:,::-1]
                     if baseline == 'avg':
                         adv = cum_reward - cum_reward.mean(axis=0)
                     elif baseline == 'best':
@@ -123,9 +130,11 @@ class TspTaskFamily(tasks_base.TaskFamily):
                         adv = cum_reward
                     else:
                         raise ValueError(f'baseline {baseline} not implemented')
-                    if normalize_advantage:
-                        adv = (adv - adv.mean(axis=0)) / (adv.std(axis=0) + 1e-8)
                 else:
+
+                    chex.assert_rank(r, 2)
+                    total_reward = r.sum(axis=-1, keepdims=True)
+                    mean_reward = total_reward.mean()
                     if baseline == 'avg':
                         adv =  total_reward - mean_reward
                     elif baseline == 'best':
@@ -134,22 +143,20 @@ class TspTaskFamily(tasks_base.TaskFamily):
                         adv =  total_reward
                     else:
                         raise ValueError(f'baseline {baseline} not implemented')
-                    if normalize_advantage:
-                        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
                 return adv 
             
-            def _pgl(self, final_state, logits, timesteps , best_reward=None):
+            def _pgl(self, trajectories, logits, advantages, weights):
                 # we need to change in the logits all rows with only -inf entries to 0 to avoid nan loss since distrax.softmax returns inf if the whole row is -inf
                 all_inf_rows = jnp.all(logits == -jnp.inf, axis=-1)
                 # broadcast row mask and use jnp.where to set all rows with only -inf entries to 0
                 logits = jnp.where(jnp.expand_dims(all_inf_rows, 2), 0., logits)
                 # logits = logits.at[all_inf_rows].set(jnp.zeros((logits.shape[-1])))
                 #  also need to avoid the actions being set to -1 since this is an invalid category in the categorical dist also leading ot -inf log prob
-                actions = final_state.trajectory[:,1:]
+                actions = trajectories[:,1:]
                 actions = jnp.where(actions==-1, 1, actions)
-                weights = jnp.roll(timesteps.discount, 1).at[:,0].set(1.)
-                weighted_reward = weights * timesteps.reward
-                advantages = self._compute_advantages(weighted_reward, best_reward)
+                # weights = jnp.roll(timesteps.discount, 1).at[:,0].set(1.)
+                # weighted_reward = weights * timesteps.reward
+                # advantages = self._compute_advantages(weighted_reward, best_reward)
                 # single_pgl = rlax.policy_gradient_loss(logits[0], actions[0], advantages[0], weights[0])
                 if rollout_actor == 'softmax':
                     pgl = jax.vmap(rlax.policy_gradient_loss)(logits, actions, advantages, weights).mean(axis=0)
@@ -168,7 +175,7 @@ class TspTaskFamily(tasks_base.TaskFamily):
             
             def init_with_state(self, key: PRNGKey) -> Tuple[Params, ModelState]:
                 # initial state is mostly static so use numpy to create since we dont want to trace but evaluate at compile time and then reuse
-                graph = knn_graph(problem, k)
+                # graph = knn_graph(problem, k)
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, # binary feature for the starting node
                     edges = {'distances': graph.edges.reshape((num_edges, -1)), 'top_k_sols': np.ones((num_edges, top_k), dtype=np.int32)},
@@ -208,14 +215,26 @@ class TspTaskFamily(tasks_base.TaskFamily):
             def loss_with_state_and_aux(self, params: Params, state: ModelState, key: PRNGKey, _: Any, with_metrics=False) -> Tuple[Array, ModelState, Mapping[str, Array]]:
                 # compute the pgl for gradient, meta loss and additional information for the optimizer
                 final_state, logits, timesteps = self._rollout(params, key)
+                if two_opt_t_max is not None:
+                    result_shape = (jax.ShapeDtypeStruct(final_state.trajectory.shape, jnp.int32), jax.ShapeDtypeStruct((final_state.trajectory.shape[0],), jnp.float32))
+                    tours, change = jax.pure_callback(jax_two_opt_cb, result_shape, dense_distance_matrix, final_state.trajectory, two_opt_t_max, first_accept)
+                else:
+                    tours = final_state.trajectory
+                    # for pgl calculations, 
+                        # need to retain action sequences as in final_state.trajectory together with logits
+                        # for reward calculations, need to retain mask
+                        # if solutions after two opt are supposed to be used, need to compute the reward from the two opt solutions
 
                 # compute reward
                 weights = jnp.roll(timesteps.discount, 1).at[:,0].set(1.)
-                weighted_reward = (weights * timesteps.reward).sum(-1)
+                weighted_reward = (weights * timesteps.reward)
+                total_reward = weighted_reward.sum(-1)
+                if two_opt_t_max is not None:
+                    total_reward = total_reward - change
 
                 # compute top k solutions
-                stacked_rewards = jnp.concatenate([state.top_k_rewards, weighted_reward])
-                stacked_sols = jnp.concatenate([state.top_k_solutions, final_state.trajectory])
+                stacked_rewards = jnp.concatenate([state.top_k_rewards, total_reward])
+                stacked_sols = jnp.concatenate([state.top_k_solutions, tours])
                 top_k_inds = jnp.argpartition(stacked_rewards*-1, kth=top_k)[:top_k]
                 top_k_rewards = stacked_rewards[top_k_inds]
                 top_k_solutions = stacked_sols[top_k_inds]
@@ -239,7 +258,8 @@ class TspTaskFamily(tasks_base.TaskFamily):
 
                 # compute pgl with baseline
                 global_best_reward = top_k_rewards[0]
-                pgl = self._pgl(final_state, logits, timesteps, global_best_reward)
+                advantages = self._compute_advantages(weighted_reward, state.top_k_rewards[0])
+                pgl = self._pgl(final_state.trajectory, logits, advantages, weights)
 
                 # compute meta loss and update model_state variable containing additional information for the optimizer and the rolling reward
                 previous_best = state.top_k_rewards[0]
